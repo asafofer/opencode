@@ -1,8 +1,9 @@
-import { expect, test } from "bun:test"
+import { expect, spyOn, test } from "bun:test"
 import { EmbeddedTerminalRenderable } from "@opentui/core"
 import { createTestRenderer } from "@opentui/core/testing"
 import { Effect, FileSystem } from "effect"
 import { Global } from "@opencode/util/global"
+import * as Open from "@opencode/util/open"
 import { SimulationRenderer } from "@opencode/simulation/frontend/renderer"
 import path from "node:path"
 import { Writable } from "node:stream"
@@ -1701,7 +1702,7 @@ test("server plugin failures share one notice and use source names before an ID 
   expect(setup.captureCharFrame()).toContain("Open plugins")
 })
 
-test("free usage limit opens OpenCode Go once when OAuth is available, lists next steps, and protects drafts", async () => {
+test("free usage limit offers OpenCode Go once when OAuth is available, lists next steps, and protects drafts", async () => {
   await using state = await tmpdir()
   const session = {
     id: "ses_free_limit",
@@ -1734,10 +1735,7 @@ test("free usage limit opens OpenCode Go once when OAuth is available, lists nex
             {
               id: "opencode-go",
               name: "OpenCode Go",
-              methods: [
-                { id: "device", type: "oauth", label: "Sign in with your OpenCode account" },
-                { type: "key" },
-              ],
+              methods: [{ id: "device", type: "oauth", label: "Sign in with your OpenCode account" }, { type: "key" }],
               connections: [],
             },
           ],
@@ -1791,8 +1789,22 @@ test("free usage limit opens OpenCode Go once when OAuth is available, lists nex
     durable: { aggregateID: session.id, seq: 2, version: 1 },
     data: { sessionID: session.id, error },
   })
+  using openSpy = spyOn(Open, "openUrl").mockResolvedValue(undefined as never)
+  await setup.waitForFrame((frame) => frame.includes("Free limit reached"))
+  const upsell = setup.captureCharFrame()
+  expect(upsell).toContain("OpenCode Go gives you reliable access")
+  expect(upsell).toContain("▀▀▀▀ ▀▀▀▀")
+  expect(upsell).toContain("opencode.ai/go")
+  expect(upsell).toContain("don't show again")
+  expect(upsell).toContain("dismiss")
+  expect(upsell).toContain("subscribe")
+  expect(upsell).not.toContain("Connect OpenCode Go")
+  expect(upsell).not.toContain("Session failed")
+  // Subscribe opens opencode.ai/go and transitions into Connect OpenCode Go (account sign-in first).
+  setup.mockInput.pressEnter()
   await setup.waitForFrame((frame) => frame.includes("Connect OpenCode Go"))
-  expect(setup.captureCharFrame()).not.toContain("Session failed")
+  expect(openSpy).toHaveBeenCalledWith("https://opencode.ai/go")
+  expect(setup.captureCharFrame()).toContain("Sign in with your OpenCode account")
   setup.mockInput.pressEscape()
   await setup.waitForFrame((frame) => !frame.includes("Connect OpenCode Go"))
   const frame = setup.captureCharFrame()
@@ -1812,7 +1824,11 @@ test("free usage limit opens OpenCode Go once when OAuth is available, lists nex
     created: 3,
     type: "session.step.failed",
     durable: { aggregateID: session.id, seq: 3, version: 1 },
-    data: { sessionID: session.id, assistantMessageID: "msg_free_assistant", error: { ...error, retryAfterMs: undefined } },
+    data: {
+      sessionID: session.id,
+      assistantMessageID: "msg_free_assistant",
+      error: { ...error, retryAfterMs: undefined },
+    },
   })
   await setup.waitForFrame((frame) => !frame.includes("They reset at"))
   expect(setup.captureCharFrame().split("Refactor the parser").length).toBe(2)
@@ -1841,8 +1857,7 @@ test("free usage limit opens OpenCode Go once when OAuth is available, lists nex
   })
   await setup.waitForFrame(
     (frame) =>
-      frame.split("You've used today's free messages").length === 3 &&
-      frame.split("Queued follow-up").length === 3,
+      frame.split("You've used today's free messages").length === 3 && frame.split("Queued follow-up").length === 3,
   )
   expect(setup.captureCharFrame()).not.toContain("Connect OpenCode Go")
 })
@@ -1900,7 +1915,7 @@ test("free usage limit skips auto-opening Go when only API key auth is registere
   })
   await setup.ready
   await setup.waitForFrame((frame) => frame.includes("Refactor the parser"))
-  // Key-only Go integration: restores prompt and renders notice, but does not open an unsolicited API key form.
+  // Key-only Go integration: opens the Go upsell modal, and "don't show again" suppresses future modals even past 24h.
   setup.events.emit({
     id: "evt_free_limit_key_1",
     created: 4,
@@ -1908,9 +1923,33 @@ test("free usage limit skips auto-opening Go when only API key auth is registere
     durable: { aggregateID: session.id, seq: 1, version: 1 },
     data: { sessionID: session.id, assistantMessageID: "msg_free_assistant", error },
   })
+  await setup.waitForFrame((frame) => frame.includes("Free limit reached"))
+  setup.mockInput.pressArrow("right")
+  setup.mockInput.pressEnter()
+  await setup.waitForFrame((frame) => !frame.includes("Free limit reached"))
   await setup.waitForFrame((frame) => frame.includes("You've used today's free messages. They reset at"))
   await setup.waitForFrame((frame) => frame.split("Refactor the parser").length === 3)
   expect(setup.captureCharFrame()).not.toContain("Connect OpenCode Go")
+
+  using _now = spyOn(Date, "now").mockReturnValue(Date.now() + 2 * 86_400_000)
+  setup.mockInput.pressKey("c", { ctrl: true })
+  await setup.waitForFrame((frame) => frame.split("Refactor the parser").length === 2)
+  setup.events.emit({
+    id: "evt_free_limit_key_2",
+    created: 5,
+    type: "session.step.started",
+    durable: { aggregateID: session.id, seq: 2, version: 1 },
+    data: { sessionID: session.id, assistantMessageID: "msg_free_assistant_2", agent: "build", model, started: 5 },
+  })
+  setup.events.emit({
+    id: "evt_free_limit_key_3",
+    created: 6,
+    type: "session.step.failed",
+    durable: { aggregateID: session.id, seq: 3, version: 1 },
+    data: { sessionID: session.id, assistantMessageID: "msg_free_assistant_2", error },
+  })
+  await setup.waitForFrame((frame) => frame.split("You've used today's free messages").length === 3)
+  expect(setup.captureCharFrame()).not.toContain("Free limit reached")
 })
 
 test("free usage limit does not overwrite a draft or open Go while typing with OAuth available", async () => {
@@ -1948,10 +1987,7 @@ test("free usage limit does not overwrite a draft or open Go while typing with O
             {
               id: "opencode-go",
               name: "OpenCode Go",
-              methods: [
-                { id: "device", type: "oauth", label: "Sign in with your OpenCode account" },
-                { type: "key" },
-              ],
+              methods: [{ id: "device", type: "oauth", label: "Sign in with your OpenCode account" }, { type: "key" }],
               connections: [],
             },
           ],

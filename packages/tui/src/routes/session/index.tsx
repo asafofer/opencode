@@ -71,6 +71,7 @@ import { DialogMessage } from "./dialog-message"
 import { DialogFork } from "./dialog-fork"
 import { DialogTimeline } from "./dialog-timeline"
 import { DialogIntegration } from "../../component/dialog-integration"
+import { DialogGoUpsell } from "../../component/dialog-go-upsell"
 import { DialogModel } from "../../component/dialog-model"
 import { useStorage } from "../../context/storage"
 import { Composer } from "./composer"
@@ -629,10 +630,15 @@ export function Session(props: {
   })
   const dialog = useDialog()
   const storage = useStorage()
-  const [goUpsell, updateGoUpsell] = storage.store<{ lastSeenAt?: number }>("go-upsell", { initial: {} })
-  const [goUpsellMemory, updateGoUpsellMemory] = storage.memory<{ lastSeenAt?: number }>("go-upsell", { initial: {} })
+  const [goUpsell, updateGoUpsell] = storage.store<{ lastSeenAt?: number; dontShow?: boolean }>("go-upsell", {
+    initial: {},
+  })
+  const [goUpsellMemory, updateGoUpsellMemory] = storage.memory<{ lastSeenAt?: number; dontShow?: boolean }>(
+    "go-upsell",
+    { initial: {} },
+  )
   const handledFreeLimits = new Set<string>()
-  // Restore the prompt when the free allowance stops it, and open the OpenCode Go connect dialog on the first hit in a day.
+  // Restore the prompt when the free allowance stops it, and offer OpenCode Go on the first hit in a day.
   onCleanup(
     data.on("session.step.failed", (event) => {
       if (event.data.sessionID !== route.sessionID || event.data.error.type !== "provider.free-limit") return
@@ -661,10 +667,7 @@ export function Session(props: {
         }
       }
       if (dialog.stack.length > 0) return
-      const goIntegration = (data.location.integration.list(location()) ?? data.location.integration.list() ?? []).find(
-        (item) => item.id === "opencode-go",
-      )
-      if (!goIntegration?.methods.some((method) => method.type === "oauth")) return
+      if (goUpsell.dontShow || goUpsellMemory.dontShow) return
       const now = Date.now()
       const seen = Math.max(goUpsell.lastSeenAt ?? 0, goUpsellMemory.lastSeenAt ?? 0)
       if (seen > 0 && now - seen < 86_400_000) return
@@ -675,10 +678,34 @@ export function Session(props: {
         draft.lastSeenAt = now
       }).catch(() => undefined)
       dialog.replace(() => (
-        <DialogIntegration
-          integrationID="opencode-go"
-          autoConnect
-          onConnected={(providerID) => dialog.replace(() => <DialogModel providerID={providerID} />)}
+        <DialogGoUpsell
+          reset={freeLimitReset(event.data.error.retryAfterMs, event.created)}
+          onDontShowAgain={() => {
+            updateGoUpsellMemory((draft) => {
+              draft.dontShow = true
+            })
+            void updateGoUpsell((draft) => {
+              draft.dontShow = true
+            }).catch(() => undefined)
+          }}
+          onSubscribe={() => {
+            const goIntegration = (
+              data.location.integration.list(location()) ??
+              data.location.integration.list() ??
+              []
+            ).find((item) => item.id === "opencode-go")
+            if (!goIntegration?.methods.some((method) => method.type === "oauth")) {
+              dialog.clear()
+              return
+            }
+            dialog.replace(() => (
+              <DialogIntegration
+                integrationID="opencode-go"
+                autoConnect
+                onConnected={(providerID) => dialog.replace(() => <DialogModel providerID={providerID} />)}
+              />
+            ))
+          }}
         />
       ))
     }),
@@ -2450,31 +2477,25 @@ function QueuedPromptDock(props: { prompts: { id: string; text: string }[]; onOp
   )
 }
 
+function freeLimitReset(delay: number | undefined, base: number) {
+  if (delay === undefined || !Number.isFinite(delay) || delay < 0 || delay > 7 * 86_400_000 || !Number.isFinite(base))
+    return
+  const at = base + delay
+  if (Number.isNaN(new Date(at).getTime())) return
+  const now = Date.now()
+  return new Date(at).toDateString() === new Date(now).toDateString() && at - now < 86_400_000
+    ? Locale.time(at)
+    : Locale.datetime(at)
+}
+
 function FreeLimitNotice(props: { message: Pick<SessionMessageAssistant, "error" | "time"> }) {
   const theme = useTheme()
-  const reset = createMemo(() => {
-    const delay = props.message.error?.retryAfterMs
-    const base = props.message.time.completed ?? props.message.time.created
-    if (
-      delay === undefined ||
-      !Number.isFinite(delay) ||
-      delay < 0 ||
-      delay > 7 * 86_400_000 ||
-      !Number.isFinite(base)
-    )
-      return
-    const at = base + delay
-    if (Number.isNaN(new Date(at).getTime())) return
-    const now = Date.now()
-    return new Date(at).toDateString() === new Date(now).toDateString() && at - now < 86_400_000
-      ? Locale.time(at)
-      : Locale.datetime(at)
-  })
+  const reset = createMemo(() =>
+    freeLimitReset(props.message.error?.retryAfterMs, props.message.time.completed ?? props.message.time.created),
+  )
   return (
     <box paddingLeft={3} flexDirection="column">
-      <text fg={theme.text.muted}>
-        You've used today's free messages.{reset() ? ` They reset at ${reset()}.` : ""}
-      </text>
+      <text fg={theme.text.muted}>You've used today's free messages.{reset() ? ` They reset at ${reset()}.` : ""}</text>
       <text fg={theme.text.muted}>
         Upgrade to OpenCode Go → <span style={{ fg: theme.text.base }}>/connect</span> · Switch model →{" "}
         <span style={{ fg: theme.text.base }}>/models</span>
